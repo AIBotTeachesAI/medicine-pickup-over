@@ -20,6 +20,7 @@ import math
 import os
 import threading
 import time
+import traceback
 
 import cv2
 import numpy as np
@@ -225,7 +226,9 @@ class ExploreRoomSkill(Primitive):
                 f"'{map_name}' map (grid={grid_spacing}m)"
             )
         except Exception as e:
-            print(f"[explore_room] Map waypoint generation failed ({e}), using fallback")
+            print(f"[explore_room] Map waypoint generation failed: {e}")
+            traceback.print_exc()
+            print("[explore_room] Using fallback waypoints")
             wps = list(_FALLBACK_WAYPOINTS)
 
         # Filter waypoints subset if requested
@@ -251,8 +254,9 @@ class ExploreRoomSkill(Primitive):
         nav_errors = []
         nav_ok = 0
 
-        # Initial 360° scan at current position
+        # Initial 360° scan at current position (before any navigation)
         if do_360_scan:
+            print("[explore_room] Initial 360° scan")
             total_captures += self._scan_360()
 
         # Visit each waypoint
@@ -296,7 +300,7 @@ class ExploreRoomSkill(Primitive):
             total_captures += transit_captures[0]
             print(f"[explore_room] Transit captured {transit_captures[0]} frames")
 
-            # Capture at this position
+            # Capture at this position (stationary = better quality)
             total_captures += self._capture_and_send()
 
             # 360° scan every 3rd waypoint
