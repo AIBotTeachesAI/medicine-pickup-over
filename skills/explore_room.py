@@ -53,6 +53,11 @@ DEFAULT_MAP = "RubysHome"
 CAPTURE_INTERVAL = 0.5  # seconds between captures while driving
 SCAN_ANGLES = 4  # 360° scan stops (camera FOV ~104°, 4×90° gives full coverage)
 
+# Minimum movement before sending a transit frame to Thor
+# Reduces redundant captures on straight paths (~40% fewer HTTP requests)
+MIN_CAPTURE_DISTANCE = 0.3  # meters
+MIN_CAPTURE_ANGLE = 0.26    # radians (~15°)
+
 # Fallback waypoints if map loading fails (Blue1 map, legacy)
 _FALLBACK_WAYPOINTS = [
     (-5.00, +1.96),
@@ -184,11 +189,13 @@ class ExploreRoomSkill(Primitive):
 
     def guidelines(self):
         return (
-            "Use this skill to map the room and build spatial memory of objects. "
-            "The robot visits waypoints across the room, capturing images for the "
-            "perception server. After mapping, use 'find_object' to locate things. "
-            "Set reset_scene=false to add to existing spatial memory instead of "
-            "starting fresh (incremental mapping)."
+            "Explore the room to build spatial memory of objects. The robot "
+            "drives to waypoints across the map, capturing images and depth "
+            "data for the perception server. After this finishes, use "
+            "find_object to navigate to any detected object by name. "
+            "Set reset_scene=false to keep existing detections and add new "
+            "ones (incremental). Set reset_scene=true (default) to start "
+            "fresh. This is the FIRST step before find_object can work."
         )
 
     def execute(
@@ -282,13 +289,29 @@ class ExploreRoomSkill(Primitive):
             capture_thread.start()
 
             # Navigate to waypoint (Nav2 handles path planning + obstacles)
+            # On failure, try nearby offsets before giving up
+            nav_succeeded = False
             try:
                 self._navigate_to(wx, wy)
-                nav_ok += 1
+                nav_succeeded = True
             except Exception as e:
-                err = f"wp{i}({wx:.1f},{wy:.1f}): {e}"
-                print(f"[explore_room] Nav failed: {err}")
-                nav_errors.append(err)
+                print(f"[explore_room] Nav to ({wx:.1f},{wy:.1f}) failed: {e}, trying offsets")
+                for dx, dy in [(0.5, 0), (-0.5, 0), (0, 0.5), (0, -0.5)]:
+                    try:
+                        self._navigate_to(wx + dx, wy + dy)
+                        print(f"[explore_room] Reached offset ({wx+dx:.1f},{wy+dy:.1f})")
+                        nav_succeeded = True
+                        break
+                    except Exception:
+                        continue
+                if not nav_succeeded:
+                    err = f"wp{i}({wx:.1f},{wy:.1f}): unreachable"
+                    print(f"[explore_room] {err}")
+                    nav_errors.append(err)
+
+            if nav_succeeded:
+                nav_ok += 1
+            else:
                 transit_stop.set()
                 capture_thread.join(timeout=2)
                 total_captures += transit_captures[0]
@@ -301,7 +324,7 @@ class ExploreRoomSkill(Primitive):
             print(f"[explore_room] Transit captured {transit_captures[0]} frames")
 
             # Capture at this position (stationary = better quality)
-            total_captures += self._capture_and_send()
+            total_captures += self._capture_and_send(force=True)
 
             # 360° scan every 3rd waypoint
             if do_360_scan and i % 3 == 0:
@@ -338,6 +361,7 @@ class ExploreRoomSkill(Primitive):
 
     _cancelled = False
     _nav2 = None
+    _last_capture_pose = None  # (x, y, yaw) of last successful capture
 
     def _navigate_to(self, x: float, y: float):
         """Use Nav2 to drive to a map-frame waypoint."""
@@ -366,12 +390,17 @@ class ExploreRoomSkill(Primitive):
                 linear_x=0.0, angular_z=0.0, duration=0.1
             )  # explicit stop
             time.sleep(1.0)  # wait for RGB + depth to settle
-            self._capture_and_send()
+            self._capture_and_send(force=True)
             captures += 1
         return captures
 
-    def _capture_and_send(self) -> int:
-        """Grab RGB from skill framework + depth/pose from cache, POST to Thor."""
+    def _capture_and_send(self, force: bool = False) -> int:
+        """Grab RGB from skill framework + depth/pose from cache, POST to Thor.
+
+        Args:
+            force: If True, skip the movement-delta check (used for stationary
+                   captures and 360° scans where we always want a frame).
+        """
         try:
             rgb_b64 = self.image
             if not rgb_b64:
@@ -387,6 +416,24 @@ class ExploreRoomSkill(Primitive):
                 print(f"[explore_room] cache not ready: {cache.get('reason')}")
                 return 0
 
+            # Skip redundant transit frames if robot hasn't moved enough
+            if not force and self._last_capture_pose is not None:
+                pose = cache.get("pose", {})
+                if pose.get("valid"):
+                    cx = pose["translation"][0]
+                    cy = pose["translation"][1]
+                    cyaw = math.atan2(
+                        2.0 * (pose["rotation"][3] * pose["rotation"][2]),
+                        1.0 - 2.0 * (pose["rotation"][2] ** 2),
+                    )
+                    lx, ly, lyaw = self._last_capture_pose
+                    dist = math.sqrt((cx - lx) ** 2 + (cy - ly) ** 2)
+                    angle = abs(cyaw - lyaw)
+                    if angle > math.pi:
+                        angle = 2 * math.pi - angle
+                    if dist < MIN_CAPTURE_DISTANCE and angle < MIN_CAPTURE_ANGLE:
+                        return 0  # skip — haven't moved enough
+
             # POST bundle to Thor (RGB + organized point cloud + pose)
             bundle = {
                 "rgb_b64": rgb_b64,
@@ -401,6 +448,17 @@ class ExploreRoomSkill(Primitive):
                 timeout=10,
             )
             if resp.status_code == 200:
+                # Update last capture pose
+                pose = cache.get("pose", {})
+                if pose.get("valid"):
+                    self._last_capture_pose = (
+                        pose["translation"][0],
+                        pose["translation"][1],
+                        math.atan2(
+                            2.0 * (pose["rotation"][3] * pose["rotation"][2]),
+                            1.0 - 2.0 * (pose["rotation"][2] ** 2),
+                        ),
+                    )
                 result = resp.json()
                 n = len(result.get("detections", []))
                 if n > 0:

@@ -21,6 +21,15 @@ from brain_client.skill_types import (
 
 THOR_URL = os.environ.get("THOR_URL", "http://172.17.30.90:8001")
 
+# Aliases: markers live inside the blue box, so any marker query → blue box
+_LABEL_ALIASES = {
+    "green pen": "blue box",
+    "green marker": "blue box",
+    "marker": "blue box",
+    "markers": "blue box",
+    "pen": "blue box",
+}
+
 
 class FindObjectSkill(Primitive):
     """Navigate to a remembered object by name."""
@@ -33,14 +42,22 @@ class FindObjectSkill(Primitive):
 
     def guidelines(self):
         return (
-            "Use this skill to navigate to a remembered object by name. "
-            "The robot must have explored the room first (use explore_room). "
-            "If the object is not found, try running explore_room with "
-            "reset_scene=false to refresh spatial memory, then retry."
+            "Navigate to a remembered object by name. The robot must have "
+            "run explore_room first to build spatial memory. Pass the object "
+            "name as label (e.g. label='medicine'). The robot drives to a "
+            "standoff position ~0.8m from the object. If not found or low "
+            "confidence, run explore_room with reset_scene=false and retry. "
+            "After arriving, you can call a pick skill if the object needs "
+            "to be grabbed."
         )
 
     def execute(self, label: str = "medicine", standoff: float = 0.8):
         label = label.strip().lower()
+        # Resolve aliases (markers are in the blue box)
+        original_label = label
+        label = _LABEL_ALIASES.get(label, label)
+        if label != original_label:
+            print(f"[find_object] '{original_label}' → '{label}' (markers are in the blue box)")
 
         try:
             resp = requests.get(
@@ -67,6 +84,14 @@ class FindObjectSkill(Primitive):
             f"[find_object] '{label}' at ({x:.2f}, {y:.2f}) in map frame, "
             f"confidence={conf:.2f}, seen {n_obs} times"
         )
+
+        # Don't navigate to low-confidence detections — likely false positives
+        if conf < 0.4:
+            return (
+                f"'{label}' detected but confidence too low ({conf:.0%}). "
+                f"Try running explore_room with reset_scene=false to get more observations.",
+                PrimitiveResult.FAILURE,
+            )
 
         # Offset target by standoff distance (stop 0.3m before the object)
         if standoff > 0:
